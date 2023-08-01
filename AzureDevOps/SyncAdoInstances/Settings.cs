@@ -4,9 +4,10 @@ using Microsoft.TeamFoundation.WorkItemTracking.WebApi.Models;
 
 using System.Collections.Generic;
 
+public record Milestone(string Release, string[] DefaultTags);
 public record ConfigItem(int Id, int RemoteId, string? Link = null);
 public record ConfigQuery(Guid Id, Guid RemoteId, string? Link = null);
-public record AdoSettings(string Org, string Project)
+public record AdoSettings(string Org, string Project, string DefaultIteration, string DefaultAreaPath)
 {
     public Uri OrgUri => new($"https://dev.azure.com/{this.Org}/");
 }
@@ -16,6 +17,7 @@ public record ReportChildPropertiesSettings(string Name, string RecurseIfNullGro
 
 public class AppSettings
 {
+    public Milestone Milestone { get; set; } = default!;
     public IList<ConfigItem> Items { get; set; } = new List<ConfigItem>();
     public IList<ConfigQuery> Queries { get; set; } = new List<ConfigQuery>();
     public AdoSettings Local { get; set; } = default!;
@@ -30,6 +32,8 @@ public record SyncSettings
 
     public string Authority { get; init; } = default!;
     public string Property { get; init; } = default!;
+
+    public string? Target { get; init; } = default;
 
     public string TargetProperty
     {

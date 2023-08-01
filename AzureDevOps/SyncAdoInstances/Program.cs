@@ -55,6 +55,7 @@ internal class Program
 
             // get work items from ADO
             IDictionary<int, WorkItem> remoteItems, localItems;
+            IEnumerable<ConfigItem> itemsToSync;
             if (this.config.Items.Any())
             {
                 remoteItems = await this.GetWorkItemsByIdAsync(this.config.Items.Select(x => x.RemoteId), true, "Scenario");
@@ -64,11 +65,34 @@ internal class Program
                 int[] duplicateRemoteIds = this.config.Items.GroupBy(x => x.RemoteId).Where(g => g.Count() > 1).Select(g => g.Key).ToArray();
                 if (duplicateIds.Length > 0 || duplicateRemoteIds.Length > 0)
                     throw new InvalidOperationException($"Duplicate items in config. Duplicate ids={JsonSerializer.Serialize(duplicateIds)}, Duplicate remoteIds={JsonSerializer.Serialize(duplicateRemoteIds)}");
+
+                itemsToSync = this.config.Items;
             }
             else if (this.config.Queries.Any())
             {
                 remoteItems = await this.GetWorkItemsByQueryAsync(this.config.Queries.Single().RemoteId, true, "Scenario");
                 localItems = await this.GetWorkItemsByQueryAsync(this.config.Queries.Single().Id, false, "Scenario");
+
+                remoteItems = remoteItems.Where(r => r.Key == 4828).ToDictionary(kv => kv.Key, kv => kv.Value);
+
+                var dynamicItemsToSync = new List<ConfigItem>();
+                // Go through local items and create any missing remote items
+                //foreach (WorkItem localItem in localItems.Values)
+                //{
+                //    WorkItem correspondingItem = await this.GetOrCreateCorrespondingItem(localItem, true, this.Remote);
+                //    remoteItems.TryAdd(correspondingItem.Id!.Value, correspondingItem);
+                //    dynamicItemsToSync.Add(new ConfigItem(localItem.Id!.Value, correspondingItem.Id!.Value, null));
+                //}
+
+                // Now go through remote items and create any missing local items
+                foreach (WorkItem remoteItem in remoteItems.Values)
+                {
+                    WorkItem correspondingItem = await this.GetOrCreateCorrespondingItem(remoteItem, false, this.Local);
+                    localItems.TryAdd(correspondingItem.Id!.Value, correspondingItem);
+                    dynamicItemsToSync.Add(new ConfigItem(correspondingItem.Id!.Value, remoteItem.Id!.Value, null));
+                }
+
+                itemsToSync = dynamicItemsToSync;
             }
             else
             {
@@ -76,7 +100,7 @@ internal class Program
             }
 
             // process sync properties
-            foreach (ConfigItem configItem in this.config.Items)
+            foreach (ConfigItem configItem in itemsToSync)
             {
                 var localContext = new Dictionary<string, object?>()
                 {
@@ -99,8 +123,8 @@ internal class Program
                 if (!remoteItems.TryGetValue(configItem.RemoteId, out WorkItem? remoteItem))
                     throw new KeyNotFoundException($"No remote item {configItem.RemoteId}.\nLocal={GetWorkItemUxHref(this.config.Local, configItem.Id).OriginalString}\nRemote={GetWorkItemUxHref(this.config.Remote, configItem.RemoteId).OriginalString}");
 
-                SyncSettings[] syncToRemote = this.config.Sync?.Where(x => x.Authority == "local").ToArray() ?? Array.Empty<SyncSettings>();
-                SyncSettings[] syncToLocal = this.config.Sync?.Where(x => x.Authority == "remote").ToArray() ?? Array.Empty<SyncSettings>();
+                SyncSettings[] syncToRemote = this.config.Sync?.Where(x => x.Authority == "local" || x.Target == "remote").ToArray() ?? Array.Empty<SyncSettings>();
+                SyncSettings[] syncToLocal = this.config.Sync?.Where(x => x.Authority == "remote" || x.Target == "local").ToArray() ?? Array.Empty<SyncSettings>();
 
                 foreach (SyncSettings? syncItem in syncToLocal)
                 {
@@ -192,6 +216,72 @@ internal class Program
         {
             this.remote?.Dispose();
             this.local?.Dispose();
+        }
+    }
+
+    private async Task<WorkItem> GetOrCreateCorrespondingItem(WorkItem item, bool remote, AdoClients otherClient)
+    {
+        var equivalentRelation = item.Relations?.FirstOrDefault(r => r.Attributes.TryGetValue("comment", out object? comment) && comment as string == "OSGS-equivalent");
+        if (equivalentRelation != null)
+        {
+            var equivalentId = int.Parse(equivalentRelation.Url[(equivalentRelation.Url.LastIndexOf('/')+1)..]);
+            var equivalentItem = await this.GetWorkItemsByIdAsync(new[] { equivalentId }, remote, "Scenario");
+            return equivalentItem.Single().Value;
+        }
+        else
+        {
+            string linkDirection = remote ? "Forward" : "Reverse";
+            var patchDocument = new JsonPatchDocument()
+            {
+                new JsonPatchOperation
+                {
+                    Operation = Operation.Add,
+                    Path = "/fields/System.AssignedTo",
+                    Value = item.Field("System.AssignedTo")
+                },
+                new JsonPatchOperation
+                {
+                    Operation = Operation.Add,
+                    Path = "/fields/System.Title",
+                    Value = item.Field("System.Title")
+                },
+                new JsonPatchOperation()
+                {
+                    Operation = Operation.Add,
+                    Path = "/fields/System.AreaPath",
+                    Value = otherClient.Settings.DefaultAreaPath
+                },
+                new JsonPatchOperation()
+                {
+                    Operation = Operation.Add,
+                    Path = "/fields/System.IterationPath",
+                    Value = otherClient.Settings.DefaultIteration
+                },
+                new JsonPatchOperation()
+                {
+                    Operation = Operation.Add,
+                    Path = "/fields/System.Tags",
+                    Value = string.Join("; ", this.config.Milestone.DefaultTags)
+                },
+                new JsonPatchOperation()
+                {
+                    Operation = Operation.Add,
+                    Path = "/relations/-",
+                    Value = new
+                    {
+                        attributes = new Dictionary<string, object>
+                        {
+                            ["comment"] = "OSGS-equivalent"
+                        },
+                        rel = $"System.LinkTypes.Dependency-{linkDirection}",
+                        url = item.Url,
+                    }
+                },
+            };
+
+            var newLocalItem = await otherClient.WorkItems.CreateWorkItemAsync(patchDocument, otherClient.ProjectId, "Scenario");
+            var localItem = await this.GetWorkItemsByIdAsync(new[] { newLocalItem.Id!.Value }, remote, "Scenario");
+            return localItem.Single().Value;
         }
     }
 
@@ -343,8 +433,11 @@ internal class Program
             }
             else
             {
-                if (fuzzyMatches.Add(sync.TargetProperty.ShortFieldName()))
-                    _ = properties.Add(sync.TargetProperty);
+                if (sync.Authority == "code" && sync.Target == authority)
+                {
+                    if (fuzzyMatches.Add(sync.TargetProperty.ShortFieldName()))
+                        _ = properties.Add(sync.TargetProperty);
+                }
             }
         }
 
@@ -380,8 +473,8 @@ internal class Program
         string[] fields = this.GetPropertiesToQuery(workItemTypes, remote);
 
         AdoClients client = remote ? this.Remote : this.Local;
-        _ = remote ? this.config.Remote.Project : this.config.Local.Project;
-        var result = (await client.WorkItems.GetWorkItemsAsync(ids, fields))
+        var project = remote ? this.config.Remote.Project : this.config.Local.Project;
+        var result = (await client.WorkItems.GetWorkItemsAsync(project, ids, fields))
             .Where(x => x.Type() == "Scenario")
             .ToList();
         List<WorkItem>? resultsWithRelations = await client.WorkItems.GetWorkItemsAsync(ids, expand: WorkItemExpand.Relations);
@@ -415,8 +508,12 @@ internal class Program
 
         AdoClients client = remote ? this.Remote : this.Local;
         string project = remote ? this.config.Remote.Project : this.config.Local.Project;
-        IEnumerable<WorkItemReference> result = (await client.WorkItems.QueryByIdAsync(project, queryId)).WorkItems;
-        return await this.GetWorkItemsByIdAsync(result.Select(wir => wir.Id), remote, workItemTypes);
+
+        WorkItemQueryResult workItemQueryResult = await client.WorkItems.QueryByIdAsync(project, queryId);
+        IEnumerable<WorkItemReference> workItems = workItemQueryResult.WorkItems ?? Enumerable.Empty<WorkItemReference>();
+        IEnumerable<WorkItemLink> workItemRelations = workItemQueryResult.WorkItemRelations?.Where(r => r.Rel == null) ?? Enumerable.Empty<WorkItemLink>();
+        List<int> ids = workItems.Select(wi => wi.Id).Union(workItemRelations.Select(wir => wir.Target.Id)).ToList();
+        return await this.GetWorkItemsByIdAsync(ids, remote, workItemTypes);
     }
 
     private async Task<WorkItem> PopulateRelations(WorkItem item, bool remote = false)
@@ -447,18 +544,27 @@ internal class Program
 
         foreach (SyncSettings syncItem in sync)
         {
-            string propertyInSource = sourceClient.GetFullFieldName(syncItem.Property, sourceItem.Type());
             string propertyInTarget = targetClient.GetFullFieldName(syncItem.TargetProperty, targetItem.Type());
 
             object? valueInSource;
-            if (propertyInSource == "id")
+            if (syncItem.Authority == "code")
             {
-                // id is a special case (it's not a field)
-                valueInSource = sourceItem.Id!.Value;
+                valueInSource = syncItem.Property == "release"
+                    ? this.config.Milestone.Release
+                    : null;
             }
             else
             {
-                valueInSource = sourceItem.Field(propertyInSource);
+                string propertyInSource = sourceClient.GetFullFieldName(syncItem.Property, sourceItem.Type());
+                if (propertyInSource == "id")
+                {
+                    // id is a special case (it's not a field)
+                    valueInSource = sourceItem.Id!.Value;
+                }
+                else
+                {
+                    valueInSource = sourceItem.Field(propertyInSource);
+                }
             }
 
             object? oldValueInTarget = targetItem.Field(propertyInTarget);
