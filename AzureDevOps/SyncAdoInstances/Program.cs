@@ -54,13 +54,26 @@ internal class Program
                 ?? throw new InvalidOperationException("Could not get link types");
 
             // get work items from ADO
-            IDictionary<int, WorkItem> remoteItems = await this.GetWorkItems(this.config.Items.Select(x => x.RemoteId), true, "Scenario");
-            IDictionary<int, WorkItem> localItems = await this.GetWorkItems(this.config.Items.Select(x => x.Id), false, "Scenario");
+            IDictionary<int, WorkItem> remoteItems, localItems;
+            if (this.config.Items.Any())
+            {
+                remoteItems = await this.GetWorkItemsByIdAsync(this.config.Items.Select(x => x.RemoteId), true, "Scenario");
+                localItems = await this.GetWorkItemsByIdAsync(this.config.Items.Select(x => x.Id), false, "Scenario");
 
-            int[] duplicateIds = this.config.Items.GroupBy(x => x.Id).Where(g => g.Count() > 1).Select(g => g.Key).ToArray();
-            int[] duplicateRemoteIds = this.config.Items.GroupBy(x => x.RemoteId).Where(g => g.Count() > 1).Select(g => g.Key).ToArray();
-            if (duplicateIds.Length > 0 || duplicateRemoteIds.Length > 0)
-                throw new InvalidOperationException($"Duplicate items in config. Duplicate ids={JsonSerializer.Serialize(duplicateIds)}, Duplicate remoteIds={JsonSerializer.Serialize(duplicateRemoteIds)}");
+                int[] duplicateIds = this.config.Items.GroupBy(x => x.Id).Where(g => g.Count() > 1).Select(g => g.Key).ToArray();
+                int[] duplicateRemoteIds = this.config.Items.GroupBy(x => x.RemoteId).Where(g => g.Count() > 1).Select(g => g.Key).ToArray();
+                if (duplicateIds.Length > 0 || duplicateRemoteIds.Length > 0)
+                    throw new InvalidOperationException($"Duplicate items in config. Duplicate ids={JsonSerializer.Serialize(duplicateIds)}, Duplicate remoteIds={JsonSerializer.Serialize(duplicateRemoteIds)}");
+            }
+            else if (this.config.Queries.Any())
+            {
+                remoteItems = await this.GetWorkItemsByQueryAsync(this.config.Queries.Single().RemoteId, true, "Scenario");
+                localItems = await this.GetWorkItemsByQueryAsync(this.config.Queries.Single().Id, false, "Scenario");
+            }
+            else
+            {
+                throw new NotSupportedException("Could not find items or queries to sync");
+            }
 
             // process sync properties
             foreach (ConfigItem configItem in this.config.Items)
@@ -243,7 +256,7 @@ internal class Program
         if (childIds.Length == 0)
             return;
 
-        IDictionary<int, WorkItem> childItems = await this.GetWorkItems(childIds, remote, "Feature", "Deliverable", "Task");
+        IDictionary<int, WorkItem> childItems = await this.GetWorkItemsByIdAsync(childIds, remote, "Feature", "Deliverable", "Task");
         foreach ((int id, WorkItem childItem) in childItems)
         {
             string childType = childItem.Type();
@@ -359,8 +372,10 @@ internal class Program
         return new(ado.OrgUri, $"{client.ProjectId}/_apis/wit/workItems/{id}");
     }
 
-    private async Task<IDictionary<int, WorkItem>> GetWorkItems(IEnumerable<int> ids, bool remote = false, params string[] workItemTypes
-        )
+    private async Task<IDictionary<int, WorkItem>> GetWorkItemsByIdAsync(
+        IEnumerable<int> ids,
+        bool remote = false,
+        params string[] workItemTypes)
     {
         string[] fields = this.GetPropertiesToQuery(workItemTypes, remote);
 
@@ -389,6 +404,19 @@ internal class Program
         }
 
         return dict;
+    }
+
+    private async Task<IDictionary<int, WorkItem>> GetWorkItemsByQueryAsync(
+        Guid queryId,
+        bool remote = false,
+        params string[] workItemTypes)
+    {
+        string[] fields = this.GetPropertiesToQuery(workItemTypes, remote);
+
+        AdoClients client = remote ? this.Remote : this.Local;
+        string project = remote ? this.config.Remote.Project : this.config.Local.Project;
+        IEnumerable<WorkItemReference> result = (await client.WorkItems.QueryByIdAsync(project, queryId)).WorkItems;
+        return await this.GetWorkItemsByIdAsync(result.Select(wir => wir.Id), remote, workItemTypes);
     }
 
     private async Task<WorkItem> PopulateRelations(WorkItem item, bool remote = false)

@@ -5,6 +5,7 @@ using Microsoft.TeamFoundation.WorkItemTracking.WebApi.Models;
 using System.Collections.Generic;
 
 public record ConfigItem(int Id, int RemoteId, string? Link = null);
+public record ConfigQuery(Guid Id, Guid RemoteId, string? Link = null);
 public record AdoSettings(string Org, string Project)
 {
     public Uri OrgUri => new($"https://dev.azure.com/{this.Org}/");
@@ -16,6 +17,7 @@ public record ReportChildPropertiesSettings(string Name, string RecurseIfNullGro
 public class AppSettings
 {
     public IList<ConfigItem> Items { get; set; } = new List<ConfigItem>();
+    public IList<ConfigQuery> Queries { get; set; } = new List<ConfigQuery>();
     public AdoSettings Local { get; set; } = default!;
     public AdoSettings Remote { get; set; } = default!;
     public ReportSettings? Report { get; set; }
