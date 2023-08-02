@@ -4,6 +4,7 @@ using Microsoft.VisualStudio.Services.WebApi.Patch.Json;
 
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Web;
 
@@ -73,23 +74,22 @@ internal class Program
                 remoteItems = await this.GetWorkItemsByQueryAsync(this.config.Queries.Single().RemoteId, true, "Scenario");
                 localItems = await this.GetWorkItemsByQueryAsync(this.config.Queries.Single().Id, false, "Scenario");
 
-                remoteItems = remoteItems.Where(r => r.Key == 4828).ToDictionary(kv => kv.Key, kv => kv.Value);
-
                 var dynamicItemsToSync = new List<ConfigItem>();
-                // Go through local items and create any missing remote items
-                //foreach (WorkItem localItem in localItems.Values)
-                //{
-                //    WorkItem correspondingItem = await this.GetOrCreateCorrespondingItem(localItem, true, this.Remote);
-                //    remoteItems.TryAdd(correspondingItem.Id!.Value, correspondingItem);
-                //    dynamicItemsToSync.Add(new ConfigItem(localItem.Id!.Value, correspondingItem.Id!.Value, null));
-                //}
-
-                // Now go through remote items and create any missing local items
+                
+                // Go through remote items and create any missing local items.
                 foreach (WorkItem remoteItem in remoteItems.Values)
                 {
                     WorkItem correspondingItem = await this.GetOrCreateCorrespondingItem(remoteItem, false, this.Local);
-                    localItems.TryAdd(correspondingItem.Id!.Value, correspondingItem);
+                    localItems[correspondingItem.Id!.Value] = correspondingItem;
                     dynamicItemsToSync.Add(new ConfigItem(correspondingItem.Id!.Value, remoteItem.Id!.Value, null));
+                }
+
+                // Go through local items and create any missing remote items
+                foreach (WorkItem localItem in localItems.Values)
+                {
+                    WorkItem correspondingItem = await this.GetOrCreateCorrespondingItem(localItem, true, this.Remote);
+                    remoteItems[correspondingItem.Id!.Value] = correspondingItem;
+                    dynamicItemsToSync.Add(new ConfigItem(localItem.Id!.Value, correspondingItem.Id!.Value, null));
                 }
 
                 itemsToSync = dynamicItemsToSync;
@@ -154,12 +154,13 @@ internal class Program
                 {
                     if (!localItem.Fields.TryGetValue(fullName, out object? value) || value is null)
                     {
+                        string title = localItem.Field<string>("System.Title");
                         // shouldReportChildren = true;
                         string warning = string.Format("{0} is null for {1} {2} {3}.\n{4}\nRecursing into children!",
                           fullName.ShortFieldName(),
                           localItem.Field<string>("System.WorkItemType"),
                           localItem.Id,
-                          localItem.Field<string>("System.Title")[0..Console.BufferWidth],
+                          title[0..Math.Min(title.Length,Console.BufferWidth)],
                           GetWorkItemUxHref(this.config.Local, localItem.Id!.Value).OriginalString);
 
                         PrintLine(warning, ConsoleColor.Yellow);
@@ -219,50 +220,25 @@ internal class Program
         }
     }
 
-    private async Task<WorkItem> GetOrCreateCorrespondingItem(WorkItem item, bool remote, AdoClients otherClient)
+    private async Task<WorkItem> GetOrCreateCorrespondingItem(WorkItem item, bool isOtherClientRemote, AdoClients otherClient)
     {
-        var equivalentRelation = item.Relations?.FirstOrDefault(r => r.Attributes.TryGetValue("comment", out object? comment) && comment as string == "OSGS-equivalent");
+        WorkItemRelation? equivalentRelation = item.Relations?.FirstOrDefault(r => r.Attributes.TryGetValue("comment", out object? comment) && comment as string == this.config.Linking.LinkComment);
         if (equivalentRelation != null)
         {
-            var equivalentId = int.Parse(equivalentRelation.Url[(equivalentRelation.Url.LastIndexOf('/')+1)..]);
-            var equivalentItem = await this.GetWorkItemsByIdAsync(new[] { equivalentId }, remote, "Scenario");
+            int equivalentId = int.Parse(equivalentRelation.Url[(equivalentRelation.Url.LastIndexOf('/') + 1)..]);
+            IDictionary<int, WorkItem> equivalentItem = await this.GetWorkItemsByIdAsync(new[] { equivalentId }, isOtherClientRemote, "Scenario");
             return equivalentItem.Single().Value;
         }
-        else
+        // If link is missing, try to find it in field
+        else if (this.config.Linking.FieldName != null &&
+            item.Fields.TryGetValue(this.config.Linking.FieldName, out object? otherWorkItemObj) &&
+            otherWorkItemObj is string otherWorkItemStr &&
+            int.TryParse(otherWorkItemStr, out int otherWorkItemId))
         {
-            string linkDirection = remote ? "Forward" : "Reverse";
-            var patchDocument = new JsonPatchDocument()
+            IDictionary<int, WorkItem> equivalentItems = await this.GetWorkItemsByIdAsync(new[] { otherWorkItemId }, isOtherClientRemote, "Scenario");
+            WorkItem equivalentItem = equivalentItems.Single().Value;
+            var addLinkPatchDocument = new JsonPatchDocument()
             {
-                new JsonPatchOperation
-                {
-                    Operation = Operation.Add,
-                    Path = "/fields/System.AssignedTo",
-                    Value = item.Field("System.AssignedTo")
-                },
-                new JsonPatchOperation
-                {
-                    Operation = Operation.Add,
-                    Path = "/fields/System.Title",
-                    Value = item.Field("System.Title")
-                },
-                new JsonPatchOperation()
-                {
-                    Operation = Operation.Add,
-                    Path = "/fields/System.AreaPath",
-                    Value = otherClient.Settings.DefaultAreaPath
-                },
-                new JsonPatchOperation()
-                {
-                    Operation = Operation.Add,
-                    Path = "/fields/System.IterationPath",
-                    Value = otherClient.Settings.DefaultIteration
-                },
-                new JsonPatchOperation()
-                {
-                    Operation = Operation.Add,
-                    Path = "/fields/System.Tags",
-                    Value = string.Join("; ", this.config.Milestone.DefaultTags)
-                },
                 new JsonPatchOperation()
                 {
                     Operation = Operation.Add,
@@ -271,18 +247,87 @@ internal class Program
                     {
                         attributes = new Dictionary<string, object>
                         {
-                            ["comment"] = "OSGS-equivalent"
+                            ["comment"] = this.config.Linking.LinkComment
                         },
-                        rel = $"System.LinkTypes.Dependency-{linkDirection}",
-                        url = item.Url,
+                        rel = $"System.LinkTypes.Remote.Dependency-Reverse",
+                        url = equivalentItem.Url,
                     }
                 },
             };
 
-            var newLocalItem = await otherClient.WorkItems.CreateWorkItemAsync(patchDocument, otherClient.ProjectId, "Scenario");
-            var localItem = await this.GetWorkItemsByIdAsync(new[] { newLocalItem.Id!.Value }, remote, "Scenario");
-            return localItem.Single().Value;
+            Print($"{GetWorkItemUxHref(item).OriginalString} Link missing, but found work item ");
+            Print(equivalentItem.Id, ConsoleColor.DarkGray);
+            WorkItem updated = await this.Remote.WorkItems.UpdateWorkItemAsync(addLinkPatchDocument, this.Remote.ProjectId, item.Id!.Value, expand: WorkItemExpand.Relations);
+            item.Relations = updated.Relations;
+            PrintLine($" . Added System.LinkTypes.Remote.Dependency-Reverse link");
+
+
+            return equivalentItem;
         }
+
+        string linkDirection = !isOtherClientRemote ? "Forward" : "Reverse";
+
+        var config = !isOtherClientRemote ? this.config.Remote : this.config.Local;
+        var patchDocument = new JsonPatchDocument()
+        {
+            new JsonPatchOperation
+            {
+                Operation = Operation.Add,
+                Path = "/fields/System.AssignedTo",
+                Value = item.Field("System.AssignedTo")
+            },
+            new JsonPatchOperation
+            {
+                Operation = Operation.Add,
+                Path = "/fields/System.Title",
+                Value = item.Field("System.Title")
+            },
+            new JsonPatchOperation()
+            {
+                Operation = Operation.Add,
+                Path = "/fields/System.AreaPath",
+                Value = otherClient.Settings.DefaultAreaPath
+            },
+            new JsonPatchOperation()
+            {
+                Operation = Operation.Add,
+                Path = "/fields/System.IterationPath",
+                Value = otherClient.Settings.DefaultIteration
+            },
+            new JsonPatchOperation()
+            {
+                Operation = Operation.Add,
+                Path = "/fields/System.Tags",
+                Value = string.Join("; ", this.config.Milestone.DefaultTags)
+            },
+            new JsonPatchOperation()
+            {
+                Operation = Operation.Add,
+                Path = $"/fields/{config.ReleaseFieldName}",
+                Value = string.Join("; ", this.config.Milestone.Release)
+            },
+            new JsonPatchOperation()
+            {
+                Operation = Operation.Add,
+                Path = "/relations/-",
+                Value = new
+                {
+                    attributes = new Dictionary<string, object>
+                    {
+                        ["comment"] = this.config.Linking.LinkComment
+                    },
+                    rel = $"System.LinkTypes.Remote.Dependency-{linkDirection}",
+                    url = item.Url,
+                }
+            },
+        };
+
+
+        Print($"{GetWorkItemUxHref(item).OriginalString} Link missing, creating new..");
+        WorkItem newLocalItem = await otherClient.WorkItems.CreateWorkItemAsync(patchDocument, otherClient.ProjectId, "Scenario");
+        IDictionary<int, WorkItem> localItem = await this.GetWorkItemsByIdAsync(new[] { newLocalItem.Id!.Value }, isOtherClientRemote, "Scenario");
+        PrintLine($"created {GetWorkItemUxHref(newLocalItem).OriginalString}");
+        return localItem.Single().Value;
     }
 
     private static void AddContextArrayItem(IDictionary<string, object?> context, string property, object? value)
@@ -302,6 +347,16 @@ internal class Program
 
             list.Add(value);
         }
+    }
+
+    private static Uri GetWorkItemUxHref(WorkItem item)
+    {
+        string encodedProject = HttpUtility.UrlPathEncode(item.Field<string>("System.TeamProject"));
+    
+        string url = item.Url
+            .Replace("_apis/wit/workItems/", $"{encodedProject}/_workitems/edit/");
+
+        return new(url);
     }
 
     private static Uri GetWorkItemUxHref(AdoSettings ado, int id)
@@ -545,6 +600,7 @@ internal class Program
         foreach (SyncSettings syncItem in sync)
         {
             string propertyInTarget = targetClient.GetFullFieldName(syncItem.TargetProperty, targetItem.Type());
+            object? oldValueInTarget = targetItem.Field(propertyInTarget);
 
             object? valueInSource;
             if (syncItem.Authority == "code")
@@ -567,18 +623,17 @@ internal class Program
                 }
             }
 
-            object? oldValueInTarget = targetItem.Field(propertyInTarget);
             if (!Equals(valueInSource?.ToString(), oldValueInTarget?.ToString()))
             {
                 // only update if the value is different
                 patch.Add(new JsonPatchOperation
                 {
-                    Operation = Operation.Replace,
+                    Operation = valueInSource == null ? Operation.Remove : Operation.Replace,
                     Path = $"/fields/{propertyInTarget}",
                     Value = valueInSource
                 });
 
-                Print($"Will update {GetWorkItemUxHref(targetAdo, targetItem.Id!.Value).OriginalString} ");
+                Print($"Will update {targetAdo.Org}/{targetItem.Id} ");
                 Print(propertyInTarget.ShortFieldName(), ConsoleColor.Cyan);
                 Print(" from ");
                 Print(oldValueInTarget, ConsoleColor.Yellow);
@@ -597,8 +652,12 @@ internal class Program
             }
         }
 
-        return patch.Count > 0
-            ? await targetClient.WorkItems.UpdateWorkItemAsync(patch, targetAdo.Project, targetItem.Id!.Value, expand: WorkItemExpand.All)
-            : targetItem;
+        if (patch.Count > 0)
+        {
+            PrintLine($"{GetWorkItemUxHref(targetItem).OriginalString} writing updates to ADO");
+            return await targetClient.WorkItems.UpdateWorkItemAsync(patch, targetAdo.Project, targetItem.Id!.Value, expand: WorkItemExpand.All);
+        }
+
+        return targetItem;
     }
 }

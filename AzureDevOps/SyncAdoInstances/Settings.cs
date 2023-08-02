@@ -7,11 +7,12 @@ using System.Collections.Generic;
 public record Milestone(string Release, string[] DefaultTags);
 public record ConfigItem(int Id, int RemoteId, string? Link = null);
 public record ConfigQuery(Guid Id, Guid RemoteId, string? Link = null);
-public record AdoSettings(string Org, string Project, string DefaultIteration, string DefaultAreaPath)
+public record AdoSettings(string Org, string Project, string DefaultIteration, string DefaultAreaPath, string ReleaseFieldName)
 {
     public Uri OrgUri => new($"https://dev.azure.com/{this.Org}/");
 }
 
+public record LinkSettings(string FieldName, string LinkComment);
 public record ReportSettings(IList<string> ReportIfNull, IList<ReportChildPropertiesSettings> Properties);
 public record ReportChildPropertiesSettings(string Name, string RecurseIfNullGroup);
 
@@ -22,6 +23,7 @@ public class AppSettings
     public IList<ConfigQuery> Queries { get; set; } = new List<ConfigQuery>();
     public AdoSettings Local { get; set; } = default!;
     public AdoSettings Remote { get; set; } = default!;
+    public LinkSettings Linking { get; set; } = default!;
     public ReportSettings? Report { get; set; }
     public IList<SyncSettings> Sync { get; set; } = new List<SyncSettings>();
 }
