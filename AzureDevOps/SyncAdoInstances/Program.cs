@@ -303,12 +303,6 @@ internal class Program
             new JsonPatchOperation()
             {
                 Operation = Operation.Add,
-                Path = $"/fields/{config.ReleaseFieldName}",
-                Value = string.Join("; ", this.config.Milestone.Release)
-            },
-            new JsonPatchOperation()
-            {
-                Operation = Operation.Add,
                 Path = "/relations/-",
                 Value = new
                 {

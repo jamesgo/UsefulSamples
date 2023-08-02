@@ -7,7 +7,7 @@ using System.Collections.Generic;
 public record Milestone(string Release, string[] DefaultTags);
 public record ConfigItem(int Id, int RemoteId, string? Link = null);
 public record ConfigQuery(Guid Id, Guid RemoteId, string? Link = null);
-public record AdoSettings(string Org, string Project, string DefaultIteration, string DefaultAreaPath, string ReleaseFieldName)
+public record AdoSettings(string Org, string Project, string DefaultIteration, string DefaultAreaPath)
 {
     public Uri OrgUri => new($"https://dev.azure.com/{this.Org}/");
 }
